@@ -11,14 +11,18 @@ import net.minecraft.creativetab.CreativeTabs;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemShears;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.EnumChatFormatting;
+import net.minecraft.world.World;
+import net.minecraftforge.common.ForgeHooks;
 import net.minecraftforge.common.IShearable;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.entity.player.PlayerEvent;
+import net.minecraftforge.event.world.BlockEvent;
 
 import com.enderio.core.api.client.gui.IAdvancedTooltipProvider;
 import com.enderio.core.common.util.BlockCoord;
@@ -33,7 +37,6 @@ import crazypants.enderio.EnderIO;
 import crazypants.enderio.EnderIOTab;
 import crazypants.enderio.config.Config;
 import crazypants.enderio.item.darksteel.upgrade.EnergyUpgrade;
-import crazypants.enderio.machine.farm.farmers.HarvestResult;
 
 public class ItemDarkSteelShears extends ItemShears
         implements IEnergyContainerItem, IAdvancedTooltipProvider, IDarkSteelItem {
@@ -118,39 +121,78 @@ public class ItemDarkSteelShears extends ItemShears
         }
 
         Block block = player.worldObj.getBlock(x, y, z);
-        if (block instanceof IShearable && ((IShearable) block).isShearable(itemstack, player.worldObj, x, y, z)) {
-            BlockCoord bc = new BlockCoord(x, y, z);
-            HarvestResult res = new HarvestResult(null, bc);
+        if (!(block instanceof IShearable) || !((IShearable) block).isShearable(itemstack, player.worldObj, x, y, z)) {
+            return super.onBlockStartBreak(itemstack, x, y, z, player);
+        }
 
-            for (int dx = -Config.darkSteelShearsBlockAreaBoostWhenPowered; dx
-                    <= Config.darkSteelShearsBlockAreaBoostWhenPowered; dx++) {
-                for (int dy = -Config.darkSteelShearsBlockAreaBoostWhenPowered; dy
-                        <= Config.darkSteelShearsBlockAreaBoostWhenPowered; dy++) {
-                    for (int dz = -Config.darkSteelShearsBlockAreaBoostWhenPowered; dz
-                            <= Config.darkSteelShearsBlockAreaBoostWhenPowered; dz++) {
-                        Block block2 = player.worldObj.getBlock(x + dx, y + dy, z + dz);
-                        if (block2 instanceof IShearable && ((IShearable) block2)
-                                .isShearable(itemstack, player.worldObj, x + dx, y + dy, z + dz)) {
-                            res.getHarvestedBlocks().add(new BlockCoord(x + dx, y + dy, z + dz));
-                        }
+        // Scan for nearby shearable blocks, excluding the clicked position
+        List<BlockCoord> targets = new ArrayList<BlockCoord>();
+        int range = Config.darkSteelShearsBlockAreaBoostWhenPowered;
+        for (int dx = -range; dx <= range; dx++) {
+            for (int dy = -range; dy <= range; dy++) {
+                for (int dz = -range; dz <= range; dz++) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    int bx = x + dx, by = y + dy, bz = z + dz;
+                    Block block2 = player.worldObj.getBlock(bx, by, bz);
+                    if (block2 instanceof IShearable
+                            && ((IShearable) block2).isShearable(itemstack, player.worldObj, bx, by, bz)) {
+                        targets.add(new BlockCoord(bx, by, bz));
                     }
                 }
             }
-
-            List<BlockCoord> sortedTargets = new ArrayList<BlockCoord>(res.getHarvestedBlocks());
-            harvestComparator.refPoint = bc;
-            Collections.sort(sortedTargets, harvestComparator);
-
-            int maxBlocks = Math.min(sortedTargets.size(), powerStored / Config.darkSteelShearsPowerUsePerDamagePoint);
-            for (int i = 0; i < maxBlocks; i++) {
-                BlockCoord bc2 = sortedTargets.get(i);
-                super.onBlockStartBreak(itemstack, bc2.x, bc2.y, bc2.z, player);
-                if (bc2 != bc) {
-                    player.worldObj.setBlockToAir(bc2.x, bc2.y, bc2.z);
-                }
-            }
         }
-        return false;
+
+        harvestComparator.refPoint = new BlockCoord(x, y, z);
+        Collections.sort(targets, harvestComparator);
+
+        // Shear the original block (super handles drops, damage, stats)
+        super.onBlockStartBreak(itemstack, x, y, z, player);
+        if (itemstack.stackSize <= 0) return true;
+        // Remove immediately with proper lifecycle hooks to trigger neighbor updates
+        removeSheared(player.worldObj, block, x, y, z, player);
+
+        // Process additional blocks with permission checks and proper lifecycle
+        EntityPlayerMP playerMP = (player instanceof EntityPlayerMP) ? (EntityPlayerMP) player : null;
+        int blocksProcessed = 1;
+        int maxBlocks = powerStored / Config.darkSteelShearsPowerUsePerDamagePoint;
+
+        for (int i = 0; i < targets.size() && blocksProcessed < maxBlocks; i++) {
+            BlockCoord bc2 = targets.get(i);
+            Block target = player.worldObj.getBlock(bc2.x, bc2.y, bc2.z);
+            if (!(target instanceof IShearable)
+                    || !((IShearable) target).isShearable(itemstack, player.worldObj, bc2.x, bc2.y, bc2.z)) {
+                continue;
+            }
+
+            // Respect chunk claims via BreakEvent
+            if (playerMP != null) {
+                BlockEvent.BreakEvent event = ForgeHooks.onBlockBreakEvent(
+                        player.worldObj,
+                        playerMP.theItemInWorldManager.getGameType(),
+                        playerMP,
+                        bc2.x,
+                        bc2.y,
+                        bc2.z);
+                if (event.isCanceled()) continue;
+            }
+
+            // Shear (drops, damage, stats) then remove with proper lifecycle
+            super.onBlockStartBreak(itemstack, bc2.x, bc2.y, bc2.z, player);
+            if (itemstack.stackSize <= 0) break;
+            removeSheared(player.worldObj, target, bc2.x, bc2.y, bc2.z, player);
+            blocksProcessed++;
+        }
+
+        return true;
+    }
+
+    private static void removeSheared(World world, Block block, int x, int y, int z, EntityPlayer player) {
+        int meta = world.getBlockMetadata(x, y, z);
+        world.playAuxSFXAtEntity(player, 2001, x, y, z, Block.getIdFromBlock(block) + (meta << 12));
+        block.onBlockHarvested(world, x, y, z, meta, player);
+        if (block.removedByPlayer(world, player, x, y, z, true)) {
+            block.onBlockDestroyedByPlayer(world, x, y, z, meta);
+        }
     }
 
     IEntitySelector selectShearable = new IEntitySelector() {
